@@ -23,7 +23,9 @@ from datetime import datetime
 
 import numpy as np
 
-VERSION = 1
+from uav_geo import m2_to_mu
+
+VERSION = 2
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".tif", ".tiff")
 
 
@@ -44,6 +46,8 @@ class FieldRec:
     warnings: list = field(default_factory=list)
     h_used: float = float("nan")
     created: str = ""
+    err_rel: float = float("nan")     # 面积相对误差（1σ），重新算面积时同步刷新
+    err_parts: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -58,6 +62,10 @@ class FieldRec:
             "warnings": list(self.warnings),
             "h_used": round(float(self.h_used), 2),
             "created": self.created or _now(),
+            "err_rel": (round(float(self.err_rel), 4)
+                        if np.isfinite(self.err_rel) else None),
+            "err_parts": {k: round(float(v), 4)
+                          for k, v in (self.err_parts or {}).items()},
         }
 
     @classmethod
@@ -73,6 +81,9 @@ class FieldRec:
             warnings=list(d.get("warnings") or []),
             h_used=float(d.get("h_used", float("nan"))),
             created=str(d.get("created", "")),
+            err_rel=(float(d["err_rel"]) if d.get("err_rel") is not None
+                     else float("nan")),
+            err_parts=dict(d.get("err_parts") or {}),
         )
 
 
@@ -148,6 +159,29 @@ class ProjectStore:
     def set_meta(self, name: str, meta_dict: dict):
         self.doc["images"].setdefault(name, {})["meta"] = meta_dict
 
+    # ---------- 单张标定（已知长度反推航高） ----------
+    def calib(self, name: str) -> dict | None:
+        """这张照片的标定记录：{h, ref_len_m, p1, p2, note}；没标定过返回 None。"""
+        return self.doc["images"].get(name, {}).get("calib")
+
+    def set_calib(self, name: str, h: float, ref_len_m: float,
+                  p1, p2, note: str = ""):
+        self.doc["images"].setdefault(name, {})["calib"] = {
+            "h": round(float(h), 3),
+            "ref_len_m": round(float(ref_len_m), 4),
+            "p1": [round(float(x), 1) for x in p1],
+            "p2": [round(float(x), 1) for x in p2],
+            "note": note,
+            "at": _now(),
+        }
+
+    def clear_calib(self, name: str):
+        self.doc["images"].get(name, {}).pop("calib", None)
+
+    def calib_h(self, name: str) -> float | None:
+        c = self.calib(name)
+        return float(c["h"]) if c and c.get("h") else None
+
     # ---------- 地块 ----------
     def fields(self, name: str) -> list:
         recs = self.doc["images"].get(name, {}).get("fields", []) or []
@@ -188,15 +222,15 @@ class ProjectStore:
         if name is not None:
             recs = self.fields(name)
             m2 = sum(r.area_m2 for r in recs)
-            return m2, m2 * 0.0015
+            return m2, m2_to_mu(m2)
         m2 = sum(r.area_m2 for n in self.images for r in self.fields(n))
-        return m2, m2 * 0.0015
+        return m2, m2_to_mu(m2)
 
     # ---------- 重算（改高度基准后用） ----------
     def recompute(self, cam_builder):
         """
         cam_builder(name, meta_dict) -> Camera
-        用存下来的轮廓点重算每块地的面积；同时刷新中心经纬度。
+        用存下来的轮廓点重算每块地的面积、误差与中心经纬度。
         返回 (成功张数, 失败张数)。
         """
         ok = bad = 0
@@ -214,8 +248,11 @@ class ProjectStore:
             for r in recs:
                 pts = np.asarray(r.contour_px, dtype=np.float64).reshape(-1, 2)
                 r.area_m2 = cam.area_of_pixels(pts)
-                r.area_mu = r.area_m2 * 0.0015
+                r.area_mu = m2_to_mu(r.area_m2)
                 r.h_used = cam.h
+                unc = cam.area_uncertainty(pts, base_area=r.area_m2)
+                r.err_rel = float(unc["rel"])
+                r.err_parts = dict(unc.get("parts") or {})
                 try:
                     lat, lon = cam.center_latlon(pts)
                     r.center = [round(lat, 8), round(lon, 8)]
@@ -233,14 +270,16 @@ class ProjectStore:
 
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
-            w.writerow(["照片", "地块编号", "地块名称", "面积_m2", "面积_亩",
+            w.writerow(["照片", "地块编号", "地块名称", "面积_m2", "面积_亩", "误差_%",
                         "中心纬度", "中心经度", "高度基准_m", "置信度", "提示"])
             for name in self.images:
                 for r in self.fields(name):
                     lat = f"{r.center[0]:.8f}" if r.center else ""
                     lon = f"{r.center[1]:.8f}" if r.center else ""
                     w.writerow([name, r.fid, r.name, f"{r.area_m2:.2f}",
-                                f"{r.area_mu:.4f}", lat, lon,
+                                f"{r.area_mu:.4f}",
+                                f"{r.err_rel * 100:.1f}" if np.isfinite(r.err_rel) else "",
+                                lat, lon,
                                 f"{r.h_used:.2f}" if np.isfinite(r.h_used) else "",
                                 f"{r.score:.3f}" if np.isfinite(r.score) else "",
                                 "；".join(r.warnings)])
@@ -251,7 +290,7 @@ class ProjectStore:
                 if not recs:
                     continue
                 m2 = sum(x.area_m2 for x in recs)
-                w.writerow([name, len(recs), f"{m2:.2f}", f"{m2 * 0.0015:.4f}"])
+                w.writerow([name, len(recs), f"{m2:.2f}", f"{m2_to_mu(m2):.4f}"])
             m2, mu = self.total_area()
             w.writerow(["全部", self.total_fields(), f"{m2:.2f}", f"{mu:.4f}"])
         return path
@@ -293,6 +332,8 @@ class ProjectStore:
                         "name": r.name,
                         "area_m2": round(r.area_m2, 2),
                         "area_mu": round(r.area_mu, 4),
+                        "error_pct": (round(r.err_rel * 100, 1)
+                                      if np.isfinite(r.err_rel) else None),
                         "height_m": round(r.h_used, 2) if np.isfinite(r.h_used) else None,
                         "score": round(r.score, 3) if np.isfinite(r.score) else None,
                         "note": "单张照片投影估算，非测绘成果",

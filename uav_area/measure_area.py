@@ -83,10 +83,17 @@ class Field:
     score: float = float("nan")
     filled_px: int = 0
     removed_px: int = 0
+    err_rel: float = float("nan")   # 面积相对误差（1σ），来自 Camera.area_uncertainty
+    err_parts: dict = field(default_factory=dict)
 
     @property
     def area_mu(self) -> float:
         return m2_to_mu(self.area_m2)
+
+    @property
+    def err_pct(self) -> float:
+        """误差百分比，直接给界面/表格用。"""
+        return self.err_rel * 100.0
 
 
 # =========================================================
@@ -297,9 +304,11 @@ def build_field(cam: Camera, mask: np.ndarray, idx: int, n_samples: int,
     notes = contour_quality_notes(sampled, mask.shape[:2], dmin, dmax,
                                   cam.meta.gimbal_pitch)
     notes += mask_quality_notes(sampled, score)
+    unc = cam.area_uncertainty(sampled, base_area=area)
     return Field(idx=idx, contour_px=sampled, pixel_area=int(mask.sum()), area_m2=area,
                  center_latlon=latlon, depth_min=dmin, depth_max=dmax,
-                 warnings=notes, score=score, filled_px=filled, removed_px=removed)
+                 warnings=notes, score=score, filled_px=filled, removed_px=removed,
+                 err_rel=float(unc["rel"]), err_parts=dict(unc.get("parts") or {}))
 
 
 # =========================================================
@@ -395,7 +404,9 @@ def draw_result_image(img, cam: Camera, fields: list, photo_name: str):
         pts = f.contour_px.astype(np.int32)
         cv2.polylines(vis, [pts], True, (0, 220, 255), max(3, int(fs * 2)))
         cx, cy = pts.mean(axis=0)
-        text = f"#{f.idx} {f.area_m2:.1f} m2 / {f.area_mu:.3f} mu"
+        # 只标总量、不堆细节；误差用 +- 是因为 Hershey 字体没有 ± 号
+        err = f" +-{f.err_pct:.1f}%" if np.isfinite(f.err_rel) else ""
+        text = f"#{f.idx} {f.area_m2:.1f}{err} m2 / {f.area_mu:.3f} mu"
         org = (int(cx) - int(90 * fs), int(cy))
         cv2.putText(vis, text, org, cv2.FONT_HERSHEY_SIMPLEX, fs,
                     (0, 0, 0), int(fs * 5), cv2.LINE_AA)
@@ -430,10 +441,12 @@ def export_results(img, cam: Camera, fields: list, photo_path: str, out_dir: str
     csv_path = os.path.join(out_dir, f"fields_{base}.csv")
     with open(csv_path, "w", newline="", encoding="utf-8-sig") as fp:
         w = csv.writer(fp)
-        w.writerow(["编号", "面积_m2", "面积_亩", "像素面积", "中心经度", "中心纬度",
-                    "高度基准_m", "置信度", "提示"])
+        w.writerow(["编号", "面积_m2", "面积_亩", "误差_%", "像素面积", "中心经度",
+                    "中心纬度", "高度基准_m", "置信度", "提示"])
         for f in fields:
-            w.writerow([f.idx, f"{f.area_m2:.2f}", f"{f.area_mu:.4f}", f.pixel_area,
+            w.writerow([f.idx, f"{f.area_m2:.2f}", f"{f.area_mu:.4f}",
+                        f"{f.err_pct:.1f}" if np.isfinite(f.err_rel) else "",
+                        f.pixel_area,
                         f"{f.center_latlon[1]:.8f}" if np.isfinite(f.center_latlon[1]) else "",
                         f"{f.center_latlon[0]:.8f}" if np.isfinite(f.center_latlon[0]) else "",
                         f"{cam.h:.2f}", f"{f.score:.3f}" if np.isfinite(f.score) else "",
@@ -673,7 +686,8 @@ class Session:
         f = build_field(self.cam, self.mask, len(self.results[self.files[self.idx]]) + 1,
                         self.n_samples, score=self.score, clean=False)
         self.results[self.files[self.idx]].append(f)
-        print(f"   ✓ 地块 #{f.idx}：{f.area_m2:.1f} m² / {f.area_mu:.3f} 亩")
+        print(f"   ✓ 地块 #{f.idx}：{f.area_m2:.1f} m² / {f.area_mu:.3f} 亩"
+              f"（±{f.err_pct:.1f}%）")
         for w in f.warnings:
             print("     提示：" + w)
         self.points, self.labels = [], []
@@ -770,7 +784,8 @@ def print_report(files: list, results: dict, errors: dict):
         grand += s
         print(f"\n{name}   地块数 {len(fields)}   合计 {s:.1f} m² / {m2_to_mu(s):.4f} 亩")
         for f in fields:
-            print(f"   #{f.idx}  {f.area_m2:9.1f} m²  {f.area_mu:7.4f} 亩"
+            err = f" ±{f.err_pct:.1f}%" if np.isfinite(f.err_rel) else ""
+            print(f"   #{f.idx}  {f.area_m2:9.1f} m²{err:<10s} {f.area_mu:7.4f} 亩"
                   f"   {'; '.join(f.warnings) if f.warnings else ''}")
     if not any_field:
         print("没有确认任何地块。")

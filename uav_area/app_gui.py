@@ -44,11 +44,11 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,
                                QGraphicsEllipseItem, QGraphicsItem,
                                QGraphicsPixmapItem, QGraphicsPolygonItem,
                                QGraphicsScene, QGraphicsSimpleTextItem,
-                               QGraphicsView, QHBoxLayout, QHeaderView, QLabel,
-                               QLineEdit, QListWidget, QListWidgetItem,
-                               QMainWindow, QMessageBox, QPushButton,
-                               QSplitter, QTableWidget, QTableWidgetItem,
-                               QToolBar, QVBoxLayout, QWidget)
+                               QGraphicsView, QHBoxLayout, QHeaderView,
+                               QInputDialog, QLabel, QLineEdit, QListWidget,
+                               QListWidgetItem, QMainWindow, QMessageBox,
+                               QPushButton, QSplitter, QTableWidget,
+                               QTableWidgetItem, QToolBar, QVBoxLayout, QWidget)
 
 import cv2                  # 必须早于 torch
 import numpy as np
@@ -140,8 +140,8 @@ class InferEngine:
 
         self.jobs = queue.Queue()
         self.out = queue.Queue()
-        self.cfg = {"target_z": 0.0, "use_lrf": False, "n_samples": 300,
-                    "clean": True, "fill_holes": True}
+        self.cfg = {"target_z": 0.0, "use_lrf": False, "calib_h": None,
+                    "n_samples": 300, "clean": True, "fill_holes": True}
         self._seg = None
         self._cam = None
         threading.Thread(target=self._loop, daemon=True).start()
@@ -154,6 +154,21 @@ class InferEngine:
 
     def configure(self, **kw):
         self.jobs.put(("config", -1, kw))
+
+    def submit_params(self, **kw):
+        """只改几何参数（高度基准 / 标定），不重新解码图像。"""
+        self.jobs.put(("params", -1, kw))
+
+    @staticmethod
+    def _make_cam(meta, cfg):
+        """Engine 与界面必须用同一套优先级，否则显示的 h 和算面积的 h 会不一致。"""
+        ch = cfg.get("calib_h")
+        if ch:
+            return Camera(meta, height_m=float(ch), height_source="calib")
+        use_lrf = bool(cfg.get("use_lrf"))
+        return Camera(meta, target_z=float(cfg.get("target_z") or 0.0),
+                      height_m=(meta.lrf_drop_m if use_lrf else None),
+                      height_source=("lrf" if use_lrf else ""))
 
     def poll(self):
         import queue
@@ -171,6 +186,10 @@ class InferEngine:
             try:
                 if kind == "config":
                     self.cfg.update(kw)
+                elif kind == "params":
+                    self.cfg.update(kw)
+                    if self._cam is not None:
+                        self._cam = self._make_cam(self._cam.meta, self.cfg)
                 elif kind == "load":
                     self._do_load(rid, kw["path"])
                 elif kind == "predict":
@@ -189,9 +208,7 @@ class InferEngine:
                   flush=True)
         img = imread_unicode(path)
         meta = read_dji_meta(path)
-        cfg = self.cfg
-        cam = Camera(meta, target_z=float(cfg["target_z"]),
-                     height_m=meta.lrf_drop_m if cfg["use_lrf"] else None)
+        cam = self._make_cam(meta, self.cfg)
         self._seg.set_image(img)
         self._cam = cam
         print(f"[引擎] 编码完成 {time.time() - t0:.1f}s", flush=True)
@@ -212,6 +229,7 @@ class InferEngine:
             "contour": f.contour_px, "area_m2": f.area_m2, "area_mu": f.area_mu,
             "score": float(scores[idx]), "warnings": list(f.warnings),
             "center": f.center_latlon, "pixel_area": f.pixel_area, "h": self._cam.h,
+            "err_rel": float(f.err_rel), "err_parts": dict(f.err_parts),
         }))
 
 
@@ -267,7 +285,7 @@ class Canvas(QGraphicsView):
         for it in self._items:
             self._scene.removeItem(it)
         self._items = []
-        for fid, name, contour, area_m2, mu, color in items:
+        for fid, name, contour, area_m2, mu, color, err in items:
             poly = QPolygonF([QPointF(float(u), float(v)) for u, v in contour])
             sel = (fid == selected_fid)
             item = QGraphicsPolygonItem(poly)
@@ -281,7 +299,9 @@ class Canvas(QGraphicsView):
             self._items.append(item)
 
             title = name if str(name).startswith("#") else f"#{fid} {name}"
-            lab = QGraphicsSimpleTextItem(f"{title}  {area_m2:.1f} m2 / {mu:.3f} mu")
+            e = f" ±{err * 100:.1f}%" if (err is not None and err == err) else ""
+            lab = QGraphicsSimpleTextItem(
+                f"{title}  {area_m2:.1f} m2{e} / {mu:.3f} mu")
             f = QFont()
             f.setPointSize(10)
             f.setBold(True)
@@ -450,6 +470,7 @@ class MainWindow(QMainWindow):
         self._bad = set()
         self._loading = False
         self._st = None
+        self._calib_pts = None    # 非 None 时处于"取标定两点"模式
 
         self._build_ui()
         self._start_engine()
@@ -487,6 +508,8 @@ class MainWindow(QMainWindow):
         self.act_next = act("下一张 ▶", lambda: self.goto(self.idx + 1))
         tb.addSeparator()
         act("高度基准", self.on_height)
+        act("标定本张", self.on_calibrate, "Ctrl+B",
+            "用画面里一段已知长度（车长、大棚跨度…）反推真实航高，纠正高度误差")
         act("导出 CSV", lambda: self.on_export("csv"))
         act("导出 GeoJSON", lambda: self.on_export("geojson"))
 
@@ -514,8 +537,8 @@ class MainWindow(QMainWindow):
         self.lbl_meta.setWordWrap(True)
         self.lbl_meta.setContentsMargins(10, 0, 10, 6)
 
-        self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["名称", "㎡", "亩"])
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["名称", "㎡", "亩", "误差"])
         self.table.verticalHeader().setVisible(False)
         self.table.setShowGrid(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -523,11 +546,18 @@ class MainWindow(QMainWindow):
         self.table.setEditTriggers(QAbstractItemView.DoubleClicked
                                    | QAbstractItemView.EditKeyPressed)
         hh = self.table.horizontalHeader()
+        hh.setMinimumSectionSize(44)
+        hh.setStretchLastSection(False)
         hh.setSectionResizeMode(0, QHeaderView.Stretch)
         hh.setSectionResizeMode(1, QHeaderView.Fixed)
         hh.setSectionResizeMode(2, QHeaderView.Fixed)
-        self.table.setColumnWidth(1, 68)
-        self.table.setColumnWidth(2, 58)
+        hh.setSectionResizeMode(3, QHeaderView.Fixed)
+        self.table.setColumnWidth(1, 66)
+        self.table.setColumnWidth(2, 60)
+        self.table.setColumnWidth(3, 58)
+        self.table.setMinimumWidth(330)
+        self.table.setToolTip("误差 = 面积的不确定度（1σ）：高度／姿态／边界三项合成，"
+                              "不是与真值比对出来的实测精度")
         self.table.verticalHeader().setDefaultSectionSize(30)
         self.table.itemChanged.connect(self.on_item_changed)
         self.table.itemSelectionChanged.connect(self.on_table_select)
@@ -564,8 +594,8 @@ class MainWindow(QMainWindow):
         rv.addWidget(self.lbl_meta)
         rv.addWidget(self.table, 1)
         rv.addWidget(bottom)
-        right.setMinimumWidth(280)
-        right.setMaximumWidth(430)
+        right.setMinimumWidth(340)
+        right.setMaximumWidth(460)
 
         split = QSplitter(Qt.Horizontal)
         split.addWidget(left)
@@ -573,6 +603,8 @@ class MainWindow(QMainWindow):
         split.addWidget(right)
         split.setSizes([int(win_w * 0.15), int(win_w * 0.60), int(win_w * 0.25)])
         split.setStretchFactor(1, 1)
+        split.setChildrenCollapsible(False)
+        self.split = split
         self.setCentralWidget(split)
 
         self.statusBar()
@@ -603,6 +635,7 @@ class MainWindow(QMainWindow):
         sc("A", lambda: self.goto(self.idx - 1))
         sc("Delete", self.delete_selected_field, widget=self.table)
         sc("F2", self.rename_selected, widget=self.table)
+        sc("Escape", self.cancel_calibration)
 
     # ---------- 引擎 ----------
     def _start_engine(self):
@@ -745,6 +778,9 @@ class MainWindow(QMainWindow):
         name = self._current_name()
         self.points, self.labels = [], []
         self.active_fid = None
+        if self._calib_pts is not None:      # 换图时退出标定取点模式
+            self._calib_pts = None
+            self.canvas.setCursor(Qt.ArrowCursor)
         self.img, self.meta, self.cam = None, None, None
         self._loading = True
         self.canvas.set_points([])
@@ -756,6 +792,7 @@ class MainWindow(QMainWindow):
         d = self.proj.defaults
         self.engine.configure(target_z=float(d.get("target_z", 0.0)),
                               use_lrf=bool(d.get("use_lrf", False)),
+                              calib_h=self.proj.calib_h(name),
                               n_samples=300, clean=True, fill_holes=True)
         self.rid += 1
         self.engine.submit_load(self.rid, os.path.join(self.proj.root, name))
@@ -766,17 +803,42 @@ class MainWindow(QMainWindow):
         self._loading = False
         self.img = p["img"]
         self.meta = p["meta"]
-        self.cam = self._cam_from_meta(self.meta)
+        name = self._current_name()
+        # 相机参数随工程一起存，换机器打开也能重算/导 GeoJSON（不依赖照片 EXIF 可读）
+        self.proj.set_meta(name, self.meta)
+        self.cam = self._cam_from_meta(self.meta, name)
         self.canvas.show_image(self.img)
         self._refresh_fields()
         self.canvas.setFocus()
-        self.lbl_status.setText(self._current_name())
-        self.lbl_meta.setText(
-            f"{self.img.shape[1]}×{self.img.shape[0]}　俯角 {self.meta['gimbal_pitch']:.1f}°\n"
-            f"高度基准 {self.cam.h:.1f} m　GSD {self.cam.gsd_at_center() * 100:.2f} cm/px")
+        self.lbl_status.setText(name)
+        self._refresh_meta_label()
         if self._st and self._st.get("phase") == "load":
             self._st["phase"] = "click"
             QTimer.singleShot(200, self._st_click)
+
+    def _refresh_meta_label(self):
+        if self.cam is None or self.img is None:
+            self.lbl_meta.setText("")
+            return
+        name = self._current_name()
+        cal = self.proj.calib(name) if (self.proj and name) else None
+        line3 = f"高度基准 {self.cam.h:.1f} m"
+        if cal:
+            line3 += (f"　已标定（参照 {cal['ref_len_m']:.2f} m）"
+                      f"　误差 ±{self._cur_err_hint():.1f}%")
+        else:
+            line3 += "　未标定"
+        self.lbl_meta.setText(
+            f"{self.img.shape[1]}×{self.img.shape[0]}　俯角 {self.meta['gimbal_pitch']:.1f}°\n"
+            f"{line3}\nGSD {self.cam.gsd_at_center() * 100:.2f} cm/px")
+
+    def _cur_err_hint(self) -> float:
+        """本图已保存地块的平均误差，没有地块时给一个参考值。"""
+        recs = self._current_fields()
+        errs = [r.err_rel * 100 for r in recs if r.err_rel == r.err_rel]
+        if errs:
+            return sum(errs) / len(errs)
+        return float("nan")
 
     def on_failed(self, rid, msg):
         print(f"[失败 rid={rid}] {msg}", flush=True)
@@ -791,14 +853,23 @@ class MainWindow(QMainWindow):
             self.lbl_status.setText("分割失败：" + msg[:160])
 
     # ---------- 相机 ----------
-    def _cam_from_meta(self, meta_dict):
+    def _cam_from_meta(self, meta_dict, name=None):
+        """
+        相机参数的唯一入口（Engine 里的 _make_cam 必须保持同样的优先级）：
+        单张标定 > LRF > 相对高度 − 地面高差。
+        """
         m = DjiMeta(**meta_dict)
         d = self.proj.defaults
-        h = m.lrf_drop_m if d.get("use_lrf") else None
-        return Camera(m, target_z=float(d.get("target_z", 0.0)), height_m=h)
+        ch = self.proj.calib_h(name) if (self.proj and name) else None
+        if ch:
+            return Camera(m, height_m=ch, height_source="calib")
+        use_lrf = bool(d.get("use_lrf"))
+        h = m.lrf_drop_m if use_lrf else None
+        return Camera(m, target_z=float(d.get("target_z", 0.0)), height_m=h,
+                      height_source=("lrf" if use_lrf else ""))
 
     def _cam_builder(self, name, meta_dict):
-        return self._cam_from_meta(meta_dict)
+        return self._cam_from_meta(meta_dict, name)
 
     # ---------- 右侧表格 ----------
     def _color_of(self, idx):
@@ -806,8 +877,35 @@ class MainWindow(QMainWindow):
 
     def _field_items(self):
         recs = self._current_fields()
-        return [(r.fid, r.name, r.contour_px, r.area_m2, r.area_mu, self._color_of(i))
+        return [(r.fid, r.name, r.contour_px, r.area_m2, r.area_mu,
+                 self._color_of(i), r.err_rel)
                 for i, r in enumerate(recs)]
+
+    @staticmethod
+    def _fmt_err(rel, sign: bool = False) -> str:
+        """表格列窄，不加 ±（表头已写"误差"、悬停有说明）；其它地方默认带 ±。"""
+        if rel is None or rel != rel:          # nan
+            return "—"
+        return f"{'±' if sign else ''}{rel * 100:.1f}%"
+
+    @staticmethod
+    def _err_color(rel) -> str:
+        if rel is None or rel != rel:
+            return "#94A3B8"
+        p = rel * 100
+        if p <= 4.0:
+            return "#047857"                   # 绿：可以直接报数
+        if p <= 8.0:
+            return "#B45309"                   # 橙：可用，但要说明量级
+        return "#DC2626"                       # 红：建议先做已知长度标定
+
+    @staticmethod
+    def _err_tip(parts) -> str:
+        if not parts:
+            return "没有误差估计"
+        return (f"高度 ±{parts.get('height', 0) * 100:.1f}%　"
+                f"姿态 ±{parts.get('attitude', 0) * 100:.1f}%　"
+                f"边界 ±{parts.get('edge', 0) * 100:.1f}%")
 
     def _refresh_fields(self):
         recs = self._current_fields()
@@ -827,6 +925,12 @@ class MainWindow(QMainWindow):
                 cell.setFlags(cell.flags() & ~Qt.ItemIsEditable)
                 cell.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 self.table.setItem(row, c, cell)
+            err = QTableWidgetItem(self._fmt_err(r.err_rel))
+            err.setFlags(err.flags() & ~Qt.ItemIsEditable)
+            err.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            err.setForeground(QBrush(QColor(self._err_color(r.err_rel))))
+            err.setToolTip(self._err_tip(r.err_parts))
+            self.table.setItem(row, 3, err)
 
         self.table.blockSignals(False)
         self._refresh_sum()
@@ -850,9 +954,17 @@ class MainWindow(QMainWindow):
         self.card_cur.style().unpolish(self.card_cur)
         self.card_cur.style().polish(self.card_cur)
         warn = ("\n⚠ " + rec.warnings[0]) if rec.warnings else ""
+        err_line = ""
+        if rec.err_rel == rec.err_rel:
+            p = rec.err_parts or {}
+            err_line = (f"面积 ±{rec.err_rel * 100:.1f}%"
+                        f"（高度 {p.get('height', 0) * 100:.1f}"
+                        f" / 姿态 {p.get('attitude', 0) * 100:.1f}"
+                        f" / 边界 {p.get('edge', 0) * 100:.1f}）\n")
         self.lbl_cur.setText(
             f"当前对象：{self._display_name(rec)}　"
             f"{rec.area_m2:.1f} m² / {rec.area_mu:.3f} 亩\n"
+            f"{err_line}"
             f"左键补点、右键排除；按回车/R 结束；点右侧其他行可切换{warn}")
         self.btn_finish.setEnabled(True)
 
@@ -880,7 +992,7 @@ class MainWindow(QMainWindow):
         if rec is not None:
             self.lbl_status.setText(
                 f"已选中 {self._display_name(rec)} —— 接下来点的点都针对它　"
-                f"{rec.area_m2:.1f} m² / {rec.area_mu:.3f} 亩")
+                f"{rec.area_m2:.1f} m² {self._fmt_err(rec.err_rel, True)} / {rec.area_mu:.3f} 亩")
         self._refresh_cur_label()
 
     def on_item_changed(self, item):
@@ -941,6 +1053,10 @@ class MainWindow(QMainWindow):
 
     # ---------- 点选 ----------
     def on_point(self, u, v, label):
+        if self._calib_pts is not None:
+            if label == 1:
+                self._calib_click(u, v)
+            return
         if self.cam is None or self._loading:
             return
         self.points.append((u, v))
@@ -963,7 +1079,9 @@ class MainWindow(QMainWindow):
                            area_m2=float(p["area_m2"]), area_mu=float(p["area_mu"]),
                            score=float(p["score"]), center=p.get("center"),
                            warnings=list(p.get("warnings") or []),
-                           h_used=float(p["h"]))
+                           h_used=float(p["h"]),
+                           err_rel=float(p.get("err_rel", float("nan"))),
+                           err_parts=dict(p.get("err_parts") or {}))
             recs.append(rec)
             self._fresh.add((self._current_name(), fid))
         else:
@@ -974,6 +1092,8 @@ class MainWindow(QMainWindow):
             rec.warnings = list(p.get("warnings") or [])
             rec.center = p.get("center")
             rec.h_used = float(p["h"])
+            rec.err_rel = float(p.get("err_rel", float("nan")))
+            rec.err_parts = dict(p.get("err_parts") or {})
 
         self.dirty = True
         self._refresh_fields()
@@ -985,7 +1105,8 @@ class MainWindow(QMainWindow):
         self._update_state()
         self.lbl_status.setText(
             f"{'新对象' if is_new else '已更新'} {self._display_name(rec)}　"
-            f"{rec.area_m2:.1f} m² / {rec.area_mu:.3f} 亩　置信度 {rec.score:.2f}")
+            f"{rec.area_m2:.1f} m² {self._fmt_err(rec.err_rel, True)} / {rec.area_mu:.3f} 亩　"
+            f"置信度 {rec.score:.2f}")
 
         if is_new:
             self._start_rename(row)
@@ -1082,12 +1203,150 @@ class MainWindow(QMainWindow):
         self.active_fid = None
         self.points, self.labels = [], []
         self.canvas.set_points([])
+        # 引擎里的相机也要换掉，否则下一次点选还用旧基准算面积
+        name = self._current_name()
+        self.engine.submit_params(target_z=tz, use_lrf=lrf,
+                                  calib_h=self.proj.calib_h(name) if name else None)
+        if self.meta and name:
+            self.cam = self._cam_from_meta(self.meta, name)
+            self._refresh_meta_label()
         self._refresh_fields()
         self._refresh_cur_label()
         self._update_title()
         self._update_state()
         self.lbl_status.setText(
             f"已按新基准重算 {ok} 张（失败 {bad} 张），记得 Ctrl+S 保存")
+
+    # ---------- 已知长度标定 ----------
+    def on_calibrate(self):
+        """
+        用画面里一段已知长度的物体反推真实航高。
+
+        原理：面积 ∝ h²，所以只要知道 h 就够了；而同一张照片里量出来的长度也 ∝ h，
+        故 h_true = h_use × 已知长度 / 量出长度 —— 与 h_use 的绝对值对不对无关，
+        这也是它比"填地面高差"更可靠的原因。
+        """
+        if not self.proj or self.cam is None:
+            self.lbl_status.setText("先打开一张照片，再点「标定本张」")
+            return
+        name = self._current_name()
+        cal = self.proj.calib(name)
+        if cal:
+            box = QMessageBox(self)
+            box.setWindowTitle("这张照片已经标定过")
+            box.setText(f"当前用标定航高 {cal['h']:.2f} m"
+                        f"（参照长度 {cal['ref_len_m']:.2f} m）")
+            b_new = box.addButton("重新标定", QMessageBox.AcceptRole)
+            b_clr = box.addButton("清除标定", QMessageBox.DestructiveRole)
+            box.addButton("取消", QMessageBox.RejectRole)
+            box.exec()
+            if box.clickedButton() is b_clr:
+                self._clear_calibration(name)
+                return
+            if box.clickedButton() is not b_new:
+                return
+        self._calib_pts = []
+        self.canvas.set_points([])
+        self.canvas.setCursor(Qt.CrossCursor)
+        self.canvas.setFocus()
+        self.lbl_status.setText(f"标定 {name}：点击参照物的一端（Esc 取消）")
+
+    def _calib_click(self, u, v):
+        self._calib_pts.append((float(u), float(v)))
+        self.canvas.set_points([(a, b, 1) for a, b in self._calib_pts])
+        if len(self._calib_pts) < 2:
+            self.lbl_status.setText("标定：再点参照物的另一端（Esc 取消）")
+            return
+        p1, p2 = self._calib_pts
+        self._calib_pts = None
+        self.canvas.setCursor(Qt.ArrowCursor)
+        self._finish_calibration(p1, p2)
+
+    def _finish_calibration(self, p1, p2):
+        L, ok = QInputDialog.getDouble(
+            self, "已知长度",
+            "这两点在实地上相距多少米？\n"
+            "（车身长度、大棚跨度、道路宽度、球场边线……越准越好）",
+            4.65, 0.01, 10000.0, 2)
+        if not ok:
+            self.canvas.set_points([])
+            self.lbl_status.setText("已取消标定")
+            return
+        self._apply_calibration(p1, p2, L)
+
+    def _apply_calibration(self, p1, p2, L) -> bool:
+        """标定核心（不弹框，便于自检直接调用）。成功返回 True。"""
+        name = self._current_name()
+        if not name or self.cam is None:
+            return False
+        try:
+            h = self.cam.implied_height(p1, p2, L)
+        except Exception as exc:
+            self.canvas.set_points([])
+            QMessageBox.warning(self, "标定失败", str(exc))
+            return False
+        if not (1.0 < h < 2000.0):
+            self.canvas.set_points([])
+            QMessageBox.warning(self, "标定结果异常",
+                                f"反推航高 {h:.1f} m，超出合理范围。\n"
+                                "多半是两点的长度或位置填错了，请重来。")
+            return False
+        self.proj.set_calib(name, h, L, p1, p2, note="GUI 已知长度标定")
+        self._sync_doc()          # 草稿先落到 doc，否则 recompute 看不到未保存的地块
+        ok_n, bad_n = self.proj.recompute(self._cam_builder)
+        self.draft = {n: self.proj.fields(n) for n in self.proj.images}
+        self.cam = self._cam_from_meta(self.meta, name)
+        self.dirty = True
+        self.active_fid = None
+        self.points, self.labels = [], []
+        self.engine.submit_params(
+            target_z=float(self.proj.defaults.get("target_z", 0.0)),
+            use_lrf=bool(self.proj.defaults.get("use_lrf", False)),
+            calib_h=h)
+        self.canvas.set_points([])
+        self._refresh_fields()
+        self._refresh_list()
+        self._refresh_cur_label()
+        self._refresh_meta_label()
+        self._update_title()
+        self._update_state()
+        self.lbl_status.setText(
+            f"{name} 标定完成：航高 {h:.2f} m（参照 {L:.2f} m）"
+            f"　已重算 {ok_n} 张，记得 Ctrl+S 保存")
+        if self.table.rowCount():
+            self.table.setCurrentCell(0, 0)     # 标定后回到第一块，卡片不至于空着
+        return True
+
+    def _clear_calibration(self, name):
+        self.proj.clear_calib(name)
+        self._sync_doc()
+        ok_n, bad_n = self.proj.recompute(self._cam_builder)
+        self.draft = {n: self.proj.fields(n) for n in self.proj.images}
+        if self.meta and name == self._current_name():
+            self.cam = self._cam_from_meta(self.meta, name)
+        self.dirty = True
+        self.active_fid = None
+        self.points, self.labels = [], []
+        self.engine.submit_params(
+            target_z=float(self.proj.defaults.get("target_z", 0.0)),
+            use_lrf=bool(self.proj.defaults.get("use_lrf", False)),
+            calib_h=None)
+        self.canvas.set_points([])
+        self._refresh_fields()
+        self._refresh_list()
+        self._refresh_cur_label()
+        self._refresh_meta_label()
+        self._update_title()
+        self._update_state()
+        self.lbl_status.setText(f"{name} 已清除标定，回到照片自带航高")
+
+    def cancel_calibration(self):
+        if self._calib_pts is None:
+            return
+        self._calib_pts = None
+        self.canvas.set_points([])
+        self.canvas.setCursor(Qt.ArrowCursor)
+        self.lbl_status.setText("已取消标定")
 
     # ---------- 导出 ----------
     def on_export(self, kind):
@@ -1115,8 +1374,9 @@ class MainWindow(QMainWindow):
             self.lbl_status.setText(f"已导出 GeoJSON：{p}（{n} 块）")
 
     # ---------- 自检 ----------
-    def start_selftest(self, click, shot):
-        self._st = {"phase": "load", "click": click, "shot": shot}
+    def start_selftest(self, click, shot, calib_len=None):
+        self._st = {"phase": "load", "click": click, "shot": shot,
+                    "calib_len": calib_len}
 
     def _st_click(self):
         if not self._st:
@@ -1124,13 +1384,63 @@ class MainWindow(QMainWindow):
         u, v = self._st["click"]
         self.on_point(float(u), float(v), 1)
 
+    def _st_calib(self, L: float):
+        """
+        自检用的一次标定：取点击点左右各 150 px 当参照物。
+        L <= 0 表示"用当前参数量出来的长度当真值"，此时标定应当不改变任何结果
+        —— 这是标定最该满足的自洽性（不该把一个本来正确的航高改坏）。
+        """
+        u, v = self._st["click"]
+        p1, p2 = (u - 150.0, v), (u + 150.0, v)
+        recs = self._current_fields()
+        a0 = recs[0].area_m2 if recs else float("nan")
+        h0 = self.cam.h
+        if L <= 0:
+            L = self.cam.distance_of_pixels(p1, p2)
+            print(f"[自检] 参照长度取当前参数实测值 {L:.3f} m（自洽性检查）", flush=True)
+        ok = self._apply_calibration(p1, p2, L)
+        recs = self._current_fields()
+        a1 = recs[0].area_m2 if recs else float("nan")
+        print(f"[自检] 标定 L={L:.3f} m：h {h0:.2f} → {self.cam.h:.2f} m，"
+              f"面积 {a0:.2f} → {a1:.2f} m²", flush=True)
+        if ok and np.isfinite(a0) and a0 > 0:
+            want = (self.cam.h / h0) ** 2
+            got = a1 / a0
+            rel = abs(got - want) / want
+            print(f"[自检] 面积倍数 {got:.6f} vs (h'/h)²={want:.6f}"
+                  f"　相对差 {rel:.2e} → {'✓ 一致' if rel < 1e-3 else '✗ 不一致'}",
+                  flush=True)
+            print("[自检] 标定记录已写入工程：" +
+                  ("✓" if self.proj.calib(self._current_name()) else "✗"), flush=True)
+        else:
+            print("[自检] ✗ 标定流程失败", flush=True)
+
     def _st_finish(self):
+        if self._st.get("calib_len") is not None:
+            self._st_calib(float(self._st["calib_len"]))
         shot = self._st.get("shot")
         if shot:
             self.grab().save(shot)
             print(f"截图已保存：{shot}")
         print("自检完成，草稿地块数：",
               sum(len(v) for v in self.draft.values()) if self.draft else 0)
+        print(f"[自检] 窗口 {self.width()}x{self.height()}　"
+              f"分栏 {self.split.sizes()}　表格宽 {self.table.width()}　"
+              f"列宽 {[self.table.columnWidth(c) for c in range(4)]}", flush=True)
+        if self.proj:
+            self._sync_doc()      # 草稿落盘，才能验证 project.json 往返
+            self.proj.save()
+            self.dirty = False
+            again = ProjectStore(self.proj.root)
+            n0 = self.proj.images[0]
+            c = again.calib(n0)
+            rr = again.fields(n0)
+            print("[自检] project.json 往返：标定 "
+                  + (f"✓ h={c['h']:.2f} m（参照 {c['ref_len_m']:.2f} m）" if c
+                     else "—（本次没标定）")
+                  + "；地块 " + (f"{len(rr)} 块，误差 ±{rr[0].err_rel * 100:.1f}%"
+                                if rr else "0 块"),
+                  flush=True)
         QApplication.instance().quit()
 
 
@@ -1156,6 +1466,8 @@ def main():
     ap.add_argument("--selftest", help="自检：给一张照片，自动点一下并截图后退出")
     ap.add_argument("--click", default="1810,1810", help="自检用的像素点 u,v")
     ap.add_argument("--shot", default="selftest.png", help="自检截图路径")
+    ap.add_argument("--calib-len", type=float, default=None,
+                    help="自检时额外做一次已知长度标定（米），验证标定链路")
     args = ap.parse_args()
 
     _install_excepthook()
@@ -1168,7 +1480,7 @@ def main():
         tmp = tempfile.mkdtemp(prefix="uavarea_")
         shutil.copy2(args.selftest, os.path.join(tmp, os.path.basename(args.selftest)))
         u, v = (float(x) for x in args.click.split(","))
-        win.start_selftest((u, v), args.shot)
+        win.start_selftest((u, v), args.shot, args.calib_len)
         win.open_project(tmp)
         win.show()
         return app.exec()

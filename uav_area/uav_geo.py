@@ -580,10 +580,14 @@ class Camera:
       - 默认 h = RelativeAltitude（相对起飞点）；
       - target_z 用来平移目标平面（目标地面比起飞点高多少米就填多少）；
       - height_m 可直接给"相机到目标平面的真实高度"，优先级最高（标定/LRF 修正用）。
+
+    height_source 只影响"高度本身有多可信"（误差预算用），不影响几何：
+      rel_alt（相机相对高度，最常用） / target_z（手工填了地面高差） /
+      lrf（激光测距） / calib（用已知长度反推，最可信） / manual。
     """
 
     def __init__(self, meta: DjiMeta, target_z: float = 0.0,
-                 height_m: float | None = None):
+                 height_m: float | None = None, height_source: str = ""):
         self.meta = meta
         self.K = build_camera_intrinsic(meta.width, meta.height,
                                         meta.hfov_deg, meta.digital_zoom)
@@ -591,8 +595,13 @@ class Camera:
                                               meta.gimbal_pitch,
                                               meta.gimbal_roll)
         self.target_z = float(target_z)
-        self.h = (float(height_m) if height_m is not None
-                  else meta.rel_altitude - self.target_z)
+        if height_m is not None:
+            self.h = float(height_m)
+            self.height_source = height_source or "manual"
+        else:
+            self.h = meta.rel_altitude - self.target_z
+            self.height_source = ("rel_alt" if abs(self.target_z) < 1e-9
+                                  else "target_z")
         if self.h <= 1.0:
             raise MetadataError(f"相机到目标平面的高度只有 {self.h:.2f} m，无法量算。")
 
@@ -601,13 +610,14 @@ class Camera:
         return float(self.K[0, 0])
 
     def with_height(self, height_m: float) -> "Camera":
-        return Camera(self.meta, target_z=0.0, height_m=height_m)
+        return Camera(self.meta, target_z=0.0, height_m=height_m,
+                      height_source="calib")
 
     def height_note(self) -> str:
-        base = "相对起飞点"
-        if abs(self.h - self.meta.rel_altitude) > 1e-6:
-            base = "已修正"
-        return f"高度基准 {self.h:.2f} m（{base}）"
+        label = {"rel_alt": "相对起飞点", "target_z": "已按地面高差修正",
+                 "lrf": "激光测距", "calib": "已知长度标定",
+                 "manual": "手工指定"}.get(self.height_source, self.height_source)
+        return f"高度基准 {self.h:.2f} m（{label}）"
 
     def ground_of(self, u, v):
         return pixel_to_ground_enu(u, v, self.K, self.R, self.h, 0.0)
@@ -648,6 +658,94 @@ class Camera:
     def gsd_at_center(self) -> float:
         """画面中心（沿光轴）的地面分辨率，米/像素，仅作参考。"""
         return self.h / self.fx
+
+    # ---------------- 误差预算 ----------------
+    def default_sigma_h(self) -> float:
+        """
+        未标定时"相机到目标地面高度"的不确定度（1σ，米）。
+
+        两个来源 RSS 合成：
+          - 相机相对高度本身：气压/IMU 融合通常 1~2%，取 2%；
+          - 目标地面与起飞点的高差没实测：平原也常有 1~3 m 起伏，取 2 m。
+        做过标定或 LRF 后高度可信度高一个量级，改用小得多的值。
+        """
+        if self.height_source in ("calib", "lrf"):
+            return math.hypot(0.005 * self.h, 0.3)
+        return math.hypot(0.02 * self.h, 2.0)
+
+    def _area_with_angles(self, pts: np.ndarray, yaw: float, pitch: float,
+                          roll: float) -> float:
+        """换一组姿态角重算面积（只用于求偏导，不改 self）。"""
+        R = build_camera_to_enu_rotation(yaw, pitch, roll)
+        g = pixel_to_ground_enu(pts[:, 0], pts[:, 1], self.K, R, self.h, 0.0)
+        return polygon_area_xy(g[:, :2])
+
+    def area_uncertainty(self, points_uv, sigma_h_m: float | None = None,
+                         sigma_pitch_deg: float = 0.5,
+                         sigma_roll_deg: float = 0.3,
+                         sigma_yaw_deg: float = 1.0,
+                         sigma_edge_px: float = 1.0,
+                         base_area: float | None = None) -> dict:
+        """
+        面积误差预算：把"这块地算出来可能差多少"拆成三项，再按平方和合成。
+
+        三项各是什么，怎么算：
+          1) 高度（主导项）：A ∝ h²，故一阶相对误差 = 2·σh/h。纯解析，最准。
+          2) 姿态：pitch/roll/yaw 各给一个 σ（DJI 云台+IMU 绝对值通常 0.3~1°），
+             用中心差分数值求导：|A(θ+σ) - A(θ-σ)| / (2A)，三个角 RSS 合成。
+             斜拍越厉害、目标离光轴越远，这项越大 —— 与实测现象一致。
+          3) 边界：轮廓每点的定位精度约 ±1 px。一阶保守取 δA ≈ P·σ（把整圈边界的
+             误差同向叠加，属上界；随机抖动其实会互相抵消，故真实值通常比它小）。
+             相对量 = σ_px · 周长_px / 面积_px。
+
+        返回 dict：rel 为合成后的相对误差（1σ），parts 是三块各自的贡献。
+        注意这是"由已知参数推断的精度"，不是与真值比对得到的实测精度。
+        """
+        pts = np.asarray(points_uv, dtype=np.float64).reshape(-1, 2)
+        base = float(base_area) if base_area is not None else self.area_of_pixels(pts)
+        if not np.isfinite(base) or base <= 0:
+            return {"area_m2": 0.0, "rel": float("nan"), "abs_m2": float("nan"),
+                    "parts": {}, "sigma_h_m": float("nan")}
+
+        # 1) 高度：A ∝ h²
+        sh = float(sigma_h_m) if sigma_h_m is not None else self.default_sigma_h()
+        rel_h = 2.0 * sh / self.h
+
+        # 2) 姿态：中心差分
+        yaw0, pitch0, roll0 = (self.meta.gimbal_yaw, self.meta.gimbal_pitch,
+                               self.meta.gimbal_roll)
+        rel_att = {}
+        for key, sig, ang0 in (("pitch", sigma_pitch_deg, pitch0),
+                               ("roll", sigma_roll_deg, roll0),
+                               ("yaw", sigma_yaw_deg, yaw0)):
+            kw = {"yaw": yaw0, "pitch": pitch0, "roll": roll0}
+            try:
+                kw[key] = ang0 + sig
+                ap = self._area_with_angles(pts, kw["yaw"], kw["pitch"], kw["roll"])
+                kw[key] = ang0 - sig
+                am = self._area_with_angles(pts, kw["yaw"], kw["pitch"], kw["roll"])
+                rel_att[key] = abs(ap - am) / (2.0 * base)
+            except RuntimeError:
+                # 扰动后有个别像素射线朝上了，说明本来就在地平线附近，这项不可估
+                rel_att[key] = 0.0
+        rel_att_total = math.sqrt(sum(v * v for v in rel_att.values()))
+
+        # 3) 边界：δA ≈ P·σ（像素域估，投影是局部线性的，相对量可直接搬）
+        per_px = float(np.sum(np.hypot(np.diff(np.r_[pts[:, 0], pts[0, 0]]),
+                                       np.diff(np.r_[pts[:, 1], pts[0, 1]]))))
+        area_px = polygon_area_xy(pts)
+        rel_edge = (float(sigma_edge_px) * per_px / area_px) if area_px > 0 else 0.0
+
+        rel = math.sqrt(rel_h ** 2 + rel_att_total ** 2 + rel_edge ** 2)
+        return {
+            "area_m2": base,
+            "rel": rel,
+            "abs_m2": base * rel,
+            "sigma_h_m": sh,
+            "parts": {"height": rel_h, "attitude": rel_att_total, "edge": rel_edge},
+            "attitude_detail": rel_att,
+            "height_source": self.height_source,
+        }
 
 
 # =========================================================
